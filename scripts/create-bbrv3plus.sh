@@ -36,6 +36,17 @@ text = plus.read_text()
 # Do NOT rename UAPI fields such as info->bbr.bbr_bw_lo.
 text = re.sub(r'(?<![.>])\bbbr_(?=[A-Za-z0-9_])', 'bbrplus_', text)
 
+# Fix token-pasted BBRv3 parameter names.
+text, macro_count = re.subn(
+    r'\bbbr_\s*##\s*name\b',
+    'bbrplus_ ## name',
+    text
+)
+if macro_count != 1:
+    raise SystemExit(
+        f'ERROR: expected one parameter macro, got {macro_count}'
+    )
+
 for old, new in (
     ('tcp_bbr_cong_ops', 'tcp_bbrplus_cong_ops'),
     ('tcp_bbr_check_kfunc_ids', 'tcp_bbrplus_check_kfunc_ids'),
