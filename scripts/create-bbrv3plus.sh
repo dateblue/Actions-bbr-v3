@@ -23,6 +23,7 @@ fi
 cp "$src" "$plus"
 bash "$script_dir/apply-bbrv3-max-profile.sh" "$plus" >/dev/null
 bash "$script_dir/apply-bbrv3-extreme-profile.sh" "$plus"
+python3 "$script_dir/apply-bbrv3-fast-recovery.py" "$plus"
 
 python3 - <<'PY'
 import re
@@ -36,16 +37,12 @@ text = plus.read_text()
 # Do NOT rename UAPI fields such as info->bbr.bbr_bw_lo.
 text = re.sub(r'(?<![.>])\bbbr_(?=[A-Za-z0-9_])', 'bbrplus_', text)
 
-# Fix token-pasted BBRv3 parameter names.
-text, macro_count = re.subn(
-    r'\bbbr_\s*##\s*name\b',
-    'bbrplus_ ## name',
-    text
-)
+# A token-pasted parameter macro needs an explicit namespace substitution:
+# the regex above cannot rename the `bbr_ ## name` token prefix.
+text, macro_count = re.subn(r'\bbbr_\s*##\s*name\b',
+                            'bbrplus_ ## name', text)
 if macro_count != 1:
-    raise SystemExit(
-        f'ERROR: expected one parameter macro, got {macro_count}'
-    )
+    raise SystemExit(f'ERROR: expected one BBR parameter macro, got {macro_count}')
 
 for old, new in (
     ('tcp_bbr_cong_ops', 'tcp_bbrplus_cong_ops'),
@@ -96,6 +93,8 @@ kconfig.write_text(kconfig_text)
 
 print('OK: independent bbrv3plus source, Kconfig and Makefile installed')
 print('OK: base tcp_bbr.c remains unchanged')
+if text.count('BBRPLUS_FAST_RECOVERY') != 1 or 'bbrplus_fast_reprobe_ready' not in text:
+    raise SystemExit('ERROR: independent fast-recovery gate is missing')
 PY
 
 # Two implementations must register different names.

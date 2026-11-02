@@ -1,0 +1,6 @@
+# Keep shell and Python sources Unix-LF even when edited from Windows.
+scripts/*.sh text eol=lf
+scripts/*.py text eol=lf
+scripts/tests/*.sh text eol=lf
+scripts/tests/*.py text eol=lf
+.github/workflows/*.yml text eol=lf
