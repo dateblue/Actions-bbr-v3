@@ -1,0 +1,179 @@
+name: BBRv3 Plus Extreme Slim ARM64
+
+# One hour-long ARM64 bindeb-pkg build ONLY on explicit release dispatch.
+# Every push instead performs the real BBR object and Brutal C-object checks.
+on:
+  push:
+    branches: [bbrv3-extreme]
+    paths:
+      - '.github/workflows/build-extreme.yml'
+      - 'scripts/**'
+      - 'integrations/tcp-brutal/COMMIT'
+      - 'patches/**'
+      - 'arm64.config'
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: Kernel version; release tags pinned by kernel-source.sh
+        required: true
+        default: '7.3.1'
+        type: string
+      build_mode:
+        description: 'check = fast preflight only; release = complete ARM64 kernel DEBs'
+        required: true
+        default: check
+        type: choice
+        options: [check, release]
+
+permissions:
+  contents: read
+concurrency:
+  group: bbrv3plus-slim-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-optional-release:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      ARCH: arm64
+      KERNEL_VERSION: ${{ inputs.kernel_version || '7.3.1' }}
+      LOCALVERSION: -bbrv3plus-slim
+      KBUILD_BUILD_USER: dateblue
+      KBUILD_BUILD_HOST: bbrv3plus-slim
+    steps:
+      - name: Checkout development branch
+        uses: actions/checkout@v4
+      - name: Check source scripts and Fast Recovery fixture tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$KERNEL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          bash -n scripts/create-bbrv3plus.sh
+          bash -n scripts/apply-bbrv3-max-profile.sh
+          bash -n scripts/apply-bbrv3-extreme-profile.sh
+          bash -n scripts/apply-oracle-a1-slim.sh
+          bash -n scripts/verify-brutal-module.sh
+          python3 -m py_compile scripts/apply-bbrv3-fast-recovery.py
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+          bash scripts/tests/test_brutal_preflight.sh
+      - name: Install kernel build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git build-essential libncurses-dev libssl-dev libelf-dev \
+            bison bc flex rsync debhelper dpkg-dev fakeroot kmod \
+            cpio dwarves libdw-dev lz4 zstd xz-utils curl jq
+      - name: Checkout pinned Linux release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit=$(bash scripts/kernel-source.sh resolve "$KERNEL_VERSION")
+          mkdir -p kernel
+          bash scripts/kernel-source.sh checkout "$KERNEL_VERSION" kernel/linux "$commit"
+      - name: Apply BBRv3 port, Max and independent Extreme/Fast Recovery
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/apply-bbrv3-port.sh"
+          sha256sum net/ipv4/tcp_bbr.c > "$GITHUB_WORKSPACE/kernel/bbr-original.sha256"
+          bash "$GITHUB_WORKSPACE/scripts/create-bbrv3plus.sh"
+          sha256sum -c "$GITHUB_WORKSPACE/kernel/bbr-original.sha256"
+          grep -Fq 'BBRPLUS_FAST_RECOVERY' net/ipv4/tcp_bbrplus.c
+          grep -Fq 'bbrplus_fast_reprobe_ready' net/ipv4/tcp_bbrplus.c
+          grep -Eq '\.name[[:space:]]*=[[:space:]]*"bbrv3plus"' net/ipv4/tcp_bbrplus.c
+          grep -Eq '\.name[[:space:]]*=[[:space:]]*"bbr"' net/ipv4/tcp_bbr.c
+      - name: Prepare and verify Oracle ARM64 Slim configuration
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-config.sh" arm64
+          scripts/config --enable TCP_CONG_BBRPLUS
+          make ARCH=arm64 olddefconfig
+          bash "$GITHUB_WORKSPACE/scripts/apply-oracle-a1-slim.sh"
+          grep -qx 'CONFIG_TCP_CONG_BBR=y' .config
+          grep -qx 'CONFIG_TCP_CONG_BBRPLUS=y' .config
+          grep -qx 'CONFIG_DEFAULT_TCP_CONG="bbr"' .config
+          grep -Eq 'bbrplus_startup_pacing_gain.*BBR_UNIT \* 7 / 2;' net/ipv4/tcp_bbrplus.c
+          grep -Eq 'bbrplus_cwnd_gain.*BBR_UNIT \* 3;' net/ipv4/tcp_bbrplus.c
+          mkdir -p "$GITHUB_WORKSPACE/build-configs"
+          cp .config "$GITHUB_WORKSPACE/build-configs/arm64-${KERNEL_VERSION}.config"
+      - name: Compile both real TCP congestion objects (preflight)
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          make ARCH=arm64 LOCALVERSION="$LOCALVERSION" -j"$(nproc)" \
+            net/ipv4/tcp_bbr.o net/ipv4/tcp_bbrplus.o
+          test -s net/ipv4/tcp_bbr.o
+          test -s net/ipv4/tcp_bbrplus.o
+      - name: Compile pinned Brutal C objects against this kernel (preflight)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verify-brutal-module.sh \
+            "$GITHUB_WORKSPACE/kernel/linux" "$LOCALVERSION" preflight
+      - name: Record preflight success
+        shell: bash
+        run: |
+          echo 'BBR and Brutal C objects verified. Full build only if explicitly dispatched as release.'
+      - name: Prepare kernel headers packaging
+        if: github.event_name == 'workflow_dispatch' && inputs.build_mode == 'release'
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-packaging.sh"
+      - name: Build full ARM64 kernel DEBs (explicit release only)
+        if: github.event_name == 'workflow_dispatch' && inputs.build_mode == 'release'
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          make ARCH=arm64 bindeb-pkg -j"$(nproc)" \
+            LOCALVERSION="$LOCALVERSION" KDEB_COMPRESS=gzip skipdbg=true
+      # Immediately upload DEBs as soon as bindeb-pkg succeeds, before any
+      # post-build validation or external .ko compilation can fail.
+      - name: Preserve built kernel DEBs immediately
+        if: github.event_name == 'workflow_dispatch' && inputs.build_mode == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbrv3plus-slim-arm64-${{ env.KERNEL_VERSION }}-debs-${{ github.run_id }}
+          path: |
+            kernel/linux-image-*.deb
+            kernel/linux-headers-*.deb
+          if-no-files-found: error
+          retention-days: 30
+      - name: Validate kernel DEB payloads
+        if: github.event_name == 'workflow_dispatch' && inputs.build_mode == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=(kernel/linux-image-*.deb)
+          headers=(kernel/linux-headers-*.deb)
+          (( ${#images[@]} == 1 && ${#headers[@]} == 1 ))
+          dpkg-deb --field "${images[0]}" Package Architecture
+          dpkg-deb --field "${headers[0]}" Package Architecture
+          [[ $(dpkg-deb -f "${images[0]}" Architecture) == arm64 ]]
+          [[ $(dpkg-deb -f "${headers[0]}" Architecture) == arm64 ]]
+          [[ $(dpkg-deb -f "${images[0]}" Package) == "linux-image-${KERNEL_VERSION}${LOCALVERSION}" ]]
+          [[ $(dpkg-deb -f "${headers[0]}" Package) == "linux-headers-${KERNEL_VERSION}${LOCALVERSION}" ]]
+      - name: Verify pinned tcp-brutal complete module ABI
+        if: github.event_name == 'workflow_dispatch' && inputs.build_mode == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verify-brutal-module.sh \
+            "$GITHUB_WORKSPACE/kernel/linux" "$LOCALVERSION" build
+      - name: Upload separately validated Brutal module
+        if: github.event_name == 'workflow_dispatch' && inputs.build_mode == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbrv3plus-slim-arm64-${{ env.KERNEL_VERSION }}-brutal-${{ github.run_id }}
+          path: kernel/brutal-*.ko
+          if-no-files-found: error
+          retention-days: 30
