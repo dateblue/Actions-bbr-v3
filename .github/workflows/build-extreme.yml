@@ -1,0 +1,127 @@
+name: BBRv3 Plus Extreme ARM64
+
+on:
+  push:
+    branches:
+      - bbrv3-extreme
+    paths:
+      - '.github/workflows/build-extreme.yml'
+      - 'scripts/create-bbrv3plus.sh'
+      - 'scripts/apply-bbrv3-extreme-profile.sh'
+      - 'scripts/apply-bbrv3-max-profile.sh'
+      - 'scripts/apply-bbrv3-port.sh'
+      - 'patches/**'
+      - 'arm64.config'
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Linux version (example: 7.3.1)'
+        required: true
+        default: '7.3.1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bbrv3plus-extreme-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      ARCH: arm64
+      KERNEL_VERSION: ${{ inputs.kernel_version || '7.3.1' }}
+      KBUILD_BUILD_USER: dateblue
+      KBUILD_BUILD_HOST: bbrv3plus-extreme
+    steps:
+      - name: Checkout development branch
+        uses: actions/checkout@v4
+
+      - name: Check version and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$KERNEL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          bash -n scripts/create-bbrv3plus.sh
+          bash -n scripts/apply-bbrv3-max-profile.sh
+          bash -n scripts/apply-bbrv3-extreme-profile.sh
+
+      - name: Install kernel build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git build-essential libncurses-dev libssl-dev libelf-dev \
+            bison bc flex rsync debhelper dpkg-dev fakeroot kmod \
+            cpio dwarves libdw-dev lz4 zstd xz-utils curl jq
+
+      - name: Checkout pinned Linux release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit=$(bash scripts/kernel-source.sh resolve "$KERNEL_VERSION")
+          mkdir -p kernel
+          bash scripts/kernel-source.sh checkout "$KERNEL_VERSION" kernel/linux "$commit"
+
+      - name: Apply upstream BBRv3 and add separate BBRv3 Plus
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/apply-bbrv3-port.sh"
+          bash "$GITHUB_WORKSPACE/scripts/create-bbrv3plus.sh"
+          grep -n '"bbrv3plus"' net/ipv4/tcp_bbrplus.c
+          grep -n '"bbr"' net/ipv4/tcp_bbr.c | tail -3
+
+      - name: Prepare ARM64 cloud kernel config
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-config.sh" arm64
+          scripts/config --enable TCP_CONG_BBRPLUS
+          make ARCH=arm64 olddefconfig
+          grep -qx 'CONFIG_TCP_CONG_BBR=y' .config
+          grep -qx 'CONFIG_TCP_CONG_BBRPLUS=y' .config
+          grep -qx 'CONFIG_DEFAULT_TCP_CONG="bbr"' .config
+          cp .config "$GITHUB_WORKSPACE/build-configs/arm64.config"
+          cp .config "$GITHUB_WORKSPACE/build-configs/arm64-${KERNEL_VERSION}.config"
+
+      - name: Compile both congestion control objects
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          make ARCH=arm64 -j"$(nproc)" net/ipv4/tcp_bbr.o net/ipv4/tcp_bbrplus.o
+
+      - name: Prepare kernel headers packaging
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-packaging.sh"
+
+      - name: Build full ARM64 kernel DEBs
+        working-directory: kernel/linux
+        shell: bash
+        run: |
+          make ARCH=arm64 bindeb-pkg -j"$(nproc)" \
+            LOCALVERSION=-bbrv3plus-extreme KDEB_COMPRESS=gzip skipdbg=true
+
+      - name: Verify release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          find kernel -maxdepth 1 -name 'linux-*.deb' -print
+          test -n "$(find kernel -maxdepth 1 -name 'linux-image-*.deb' -print -quit)"
+          test -n "$(find kernel -maxdepth 1 -name 'linux-headers-*.deb' -print -quit)"
+          ! find kernel -maxdepth 1 \( -name '*-dbg*.deb' -o -name '*-dbgsym*.deb' \) | grep -q .
+
+      - name: Upload test kernel packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbrv3plus-extreme-arm64-${{ env.KERNEL_VERSION }}
+          path: kernel/linux-*.deb
+          if-no-files-found: error
