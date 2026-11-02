@@ -1,4 +1,4 @@
-name: BBRv3 Plus Extreme ARM64
+name: BBRv3 Plus Extreme Slim ARM64
 
 on:
   push:
@@ -8,6 +8,9 @@ on:
       - '.github/workflows/build-extreme.yml'
       - 'scripts/create-bbrv3plus.sh'
       - 'scripts/apply-bbrv3-extreme-profile.sh'
+      - 'scripts/apply-oracle-a1-slim.sh'
+      - 'scripts/verify-brutal-module.sh'
+      - 'integrations/tcp-brutal/COMMIT'
       - 'scripts/apply-bbrv3-max-profile.sh'
       - 'scripts/apply-bbrv3-port.sh'
       - 'patches/**'
@@ -48,6 +51,8 @@ jobs:
           bash -n scripts/create-bbrv3plus.sh
           bash -n scripts/apply-bbrv3-max-profile.sh
           bash -n scripts/apply-bbrv3-extreme-profile.sh
+          bash -n scripts/apply-oracle-a1-slim.sh
+          bash -n scripts/verify-brutal-module.sh
 
       - name: Install kernel build dependencies
         shell: bash
@@ -84,9 +89,12 @@ jobs:
           bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-config.sh" arm64
           scripts/config --enable TCP_CONG_BBRPLUS
           make ARCH=arm64 olddefconfig
+          bash "$GITHUB_WORKSPACE/scripts/apply-oracle-a1-slim.sh"
           grep -qx 'CONFIG_TCP_CONG_BBR=y' .config
           grep -qx 'CONFIG_TCP_CONG_BBRPLUS=y' .config
           grep -qx 'CONFIG_DEFAULT_TCP_CONG="bbr"' .config
+          grep -Eq 'bbrplus_startup_pacing_gain.*BBR_UNIT \* 7 / 2;' net/ipv4/tcp_bbrplus.c
+          grep -Eq 'bbrplus_cwnd_gain.*BBR_UNIT \* 3;' net/ipv4/tcp_bbrplus.c
           cp .config "$GITHUB_WORKSPACE/build-configs/arm64.config"
           cp .config "$GITHUB_WORKSPACE/build-configs/arm64-${KERNEL_VERSION}.config"
 
@@ -108,7 +116,13 @@ jobs:
         shell: bash
         run: |
           make ARCH=arm64 bindeb-pkg -j"$(nproc)" \
-            LOCALVERSION=-bbrv3plus-extreme KDEB_COMPRESS=gzip skipdbg=true
+            LOCALVERSION=-bbrv3plus-slim KDEB_COMPRESS=gzip skipdbg=true
+
+      - name: Build pinned tcp-brutal module against this kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verify-brutal-module.sh "$GITHUB_WORKSPACE/kernel/linux" -bbrv3plus-slim
 
       - name: Verify release artifacts
         shell: bash
@@ -122,6 +136,9 @@ jobs:
       - name: Upload test kernel packages
         uses: actions/upload-artifact@v4
         with:
-          name: bbrv3plus-extreme-arm64-${{ env.KERNEL_VERSION }}
-          path: kernel/linux-*.deb
+          name: bbrv3plus-extreme-slim-arm64-${{ env.KERNEL_VERSION }}
+          path: |
+            kernel/linux-image-*.deb
+            kernel/linux-headers-*.deb
+            kernel/brutal-*.ko
           if-no-files-found: error
